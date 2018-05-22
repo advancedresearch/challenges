@@ -4,35 +4,39 @@ extern crate sdl2_window;
 extern crate opengl_graphics;
 extern crate graphics;
 extern crate vecmath;
-extern crate interpolation;
 extern crate rand;
 extern crate bee_challenge;
 
-use asi::Runtime;
 use opengl_graphics::*;
 use sdl2_window::Sdl2Window;
 use piston::window::*;
-use piston::event_loop::*;
 use piston::input::*;
 use graphics::*;
-use interpolation::EaseFunction;
-use bee_challenge::{
-    Actuator,
-    App,
-    AppPhysicsSettings,
-    AppRenderSettings,
-    Bee,
-    BeeState,
-    DecisionMaker,
-    DistanceHeuristicController,
-    FlapState,
-    FlapWing,
-    Flower,
-    Hive,
-    Memory,
-    Sensor,
-    SubGoal,
-};
+use bee_challenge::{run, WingController};
+
+struct Backend {
+    gl: GlGraphics,
+}
+
+impl bee_challenge::Backend for Backend {
+    type Graphics = GlGraphics;
+    type Texture = Texture;
+
+    fn load_bee_texture(&self) -> Texture {
+        Texture::from_path(
+            "assets/bee.png",
+            &TextureSettings::new()
+        ).unwrap()
+    }
+
+    fn draw<F: FnMut(Context, &mut Self::Graphics)>(
+        &mut self,
+        render_args: RenderArgs,
+        mut f: F
+    ) {
+        self.gl.draw(render_args.viewport(), |c, g| f(c, g));
+    }
+}
 
 fn main() {
     let opengl = OpenGL::V3_2;
@@ -40,132 +44,122 @@ fn main() {
         .exit_on_esc(true)
         .opengl(opengl);
     let mut window: Sdl2Window = settings.build().unwrap();
-    // Run as fast as possible to train the bee.
-    let event_settings = EventSettings::new().bench_mode(true).ups(10).max_fps(2);
-    let mut events = Events::new(event_settings);
-    let mut gl = GlGraphics::new(opengl);
-    let hive_pos = [200.0, 200.0];
-    let flower_pos = [200.0, 100.0];
-    let bee_texture: Texture = Texture::from_path(
-        "assets/bee.png",
-        &TextureSettings::new()
-    ).unwrap();
-    let mut app = App {
-        hive: Hive {
-            pos: hive_pos
-        },
-        flower: Flower {
-            pos: flower_pos
-        },
-        bee: Bee {
-            pos: hive_pos,
-            vel: [0.0; 2],
-            state: BeeState::InAir
-        },
-        textures: vec![
-            bee_texture,
-        ],
-        render_settings: AppRenderSettings {
-            draw_bee_pos: true,
-            draw_target_pos: true,
-        },
-        physics_settings: AppPhysicsSettings {
-            gravity: [0.0, 20.0],
-        },
-        runtime: asi::StandardRuntime::new(),
+
+    let backend = Backend {
+        gl: GlGraphics::new(opengl)
     };
-    let flap_repeat = 0.25;
     let tune = 0.1;
-    app.runtime.load(asi::Agent {
-        actuators: vec![
-            Actuator::FlapLeft(FlapWing {
-                received: true,
-                // When flapping left wing, move right-up.
-                impulse: [30.0, -30.0],
-                force_function: EaseFunction::QuadraticInOut,
-                remaining: 0.0,
-                repeat_delay: flap_repeat,
-            }),
-            Actuator::FlapRight(FlapWing {
-                received: true,
-                // When flapping right wing, move left-up.
-                impulse: [-30.0, -30.0],
-                force_function: EaseFunction::QuadraticInOut,
-                remaining: 0.0,
-                repeat_delay: flap_repeat,
-            }),
-        ],
-        sensors: vec![
-            Sensor::Position([0.0; 2]),
-        ],
-        memory: vec![
-            Memory::Dummy,
-            Memory::Dummy,
-        ],
-        decision_maker: DecisionMaker {
-            sub_goal: SubGoal::GoToFlower,
-            left_flap_state: FlapState {wait: 0.0},
-            right_flap_state: FlapState {wait: 0.25},
-            left_repeat: 1.4,
-            right_repeat: 1.4,
-            left_min_repeat: flap_repeat,
-            right_min_repeat: flap_repeat,
-            left_wing_controller: DistanceHeuristicController {
-                started: false,
-                value: 0.0,
-                old_distance: [0.0; 2],
-                prediction: [1.0; 2],
-                error: 20.0,
-                tune,
-                children: vec![],
-            },
-            right_wing_controller: DistanceHeuristicController {
-                started: false,
-                value: 0.0,
-                old_distance: [0.0; 2],
-                prediction: [1.0; 2],
-                error: 20.0,
-                tune,
-                children: vec![],
-            },
-            target: hive_pos,
-            position: hive_pos,
-            avg: [0.0; 2],
-        },
-    });
-    app.runtime.start();
-    let mut tries = 0;
-    let mut time = 0.0;
-    let mut record = 0.0;
-    while let Some(e) = events.next(&mut window) {
-        app.event(&e);
-        if let Some(args) = e.render_args() {
-            gl.draw(args.viewport(), |c, g| {
-                clear(color::hex("ffffff"), g);
-                app.draw(&c, g);
-            })
-        }
+    let left = HeuristicController {
+        started: false,
+        value: 0.0,
+        old_vector: [0.0; 2],
+        prediction: [1.0; 2],
+        error: 20.0,
+        tune,
+        children: vec![],
+    };
+    let right = HeuristicController {
+        started: false,
+        value: 0.0,
+        old_vector: [0.0; 2],
+        prediction: [1.0; 2],
+        error: 20.0,
+        tune,
+        children: vec![],
+    };
+    run(&mut window, left, right, backend);
+}
 
-        if let Some(args) = e.update_args() {
-            time += args.dt;
-        }
+pub struct HeuristicController {
+    /// Whether the controller has started.
+    pub started: bool,
+    /// Control value.
+    pub value: f64,
+    /// The old vector.
+    pub old_vector: [f64; 2],
+    /// The predicted change in distance per unit of time.
+    pub prediction: [f64; 2],
+    /// Predicted error in predicted change.
+    pub error: f64,
+    /// A factor describing how much to tune predictions.
+    pub tune: f64,
+    /// A list of sub-controlelrs which predicts how the controller would behave
+    /// if the control value was changed.
+    /// These sub-controllers advice the prediction.
+    pub children: Vec<HeuristicController>,
+}
 
-        let reset = e.press_args().is_some() ||
-                    vecmath::vec2_len(vecmath::vec2_sub(app.bee.pos, hive_pos)) > 200.0;
+impl WingController for HeuristicController {
+    fn get_started(&self) -> bool {self.started}
+    fn set_started(&mut self, value: bool) {self.started = value}
+    fn get_value(&self) -> f64 {self.value}
+    fn get_prediction(&self) -> [f64; 2] {self.prediction}
+    fn set_prediction(&mut self, value: [f64; 2]) {self.prediction = value}
+    fn get_error(&self) -> f64 {self.error}
+    fn set_error(&mut self, value: f64) {self.error = value}
+    fn get_old_vector(&self) -> [f64; 2] {self.old_vector}
+    fn set_old_vector(&mut self, value: [f64; 2]) {self.old_vector = value}
+    fn get_tune(&self) -> f64 {self.tune}
 
-        if reset {
-            app.bee.pos = hive_pos;
-            app.bee.vel = [0.0; 2];
-            let ref mut dm = app.runtime.agent.as_mut().unwrap().decision_maker;
-            dm.left_wing_controller.started = false;
-            dm.right_wing_controller.started = false;
-            dm.avg = [0.0; 2];
-            tries += 1;
-            window.set_title(format!("asi_core0: bee ({}, {:.2})", tries, record));
-            if time > record {
-                record = time;
+    fn set_value(&mut self, value: f64) {
+        if value == self.value {return};
+
+        let mut min_value_dist: Option<(usize, f64)> = None;
+        for i in 0..self.children.len() {
+            let ref mut child = self.children[i];
+            let value_dist = (child.value - value) * (child.value - value);
+            if min_value_dist.is_none() || min_value_dist.unwrap().1 > value_dist {
+                min_value_dist = Some((i, value_dist));
             }
-            time = 0.0;
         }
+
+        if let Some((i, child_value)) = min_value_dist {
+            if child_value < (self.value - value) * (self.value - value) {
+                use std::mem::swap;
+
+                // Swap values with child since it is more likely to be
+                // a better starting point than the current one.
+                let ref mut child = self.children[i];
+                swap(&mut self.prediction, &mut child.prediction);
+                swap(&mut self.value, &mut child.value);
+                swap(&mut self.old_vector, &mut child.old_vector);
+                swap(&mut self.error, &mut child.error);
+                self.value = value;
+                return;
+            }
+        }
+        if self.children.len() < 1 {
+            // Remember what is learned so far.
+            let new_child = HeuristicController {children: vec![], ..*self};
+            self.children.push(new_child);
+        }
+
+        self.value = value;
+    }
+
+    fn predict(&self, new_value: f64, dt: f64) -> [f64; 2] {
+        use vecmath::vec2_add as add;
+        use vecmath::vec2_scale as scale;
+        use vecmath::vec2_len as len;
+
+        // Use weighted average of predictions of itself and children.
+        // Compute weight by taking into account how close they are to the new value,
+        // how close their last distance is to extrapolated half distance,
+        // and how far into the future and the predicted error.
+        // Estimate the predicted distance given no change.
+        let dist = len(add(self.old_vector, scale(self.prediction, 0.5 * dt)));
+        let mut weight = 1.0 / ((self.value - new_value) * (self.value - new_value) + dt + self.error);
+        let mut prediction = scale(self.prediction, weight);
+        for i in 0..self.children.len() {
+            let ref child = self.children[i];
+            // Compute the predicted distance of child.
+            let child_dist = len(add(child.old_vector, scale(child.prediction, 0.5 * dt)));
+            let w = 1.0 /
+                    ((child.value - new_value) * (child.value - new_value) +
+                     (child_dist - dist) * (child_dist - dist) + dt + child.error);
+            prediction = add(prediction, scale(child.prediction, w));
+            weight += w;
+        }
+        scale(prediction, dt / weight)
     }
 }

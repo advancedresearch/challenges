@@ -7,12 +7,139 @@ extern crate rand;
 
 use asi::{ActuatorId, MemoryId, SensorId, Runtime};
 use piston::input::*;
+use piston::event_loop::*;
+use piston::window::AdvancedWindow;
 use interpolation::EaseFunction;
 use graphics::*;
 use std::error::Error;
 use std::fmt;
 
 const BEE_TEXTURE: usize = 0;
+
+pub trait Backend {
+    type Graphics: Graphics<Texture = Self::Texture>;
+    type Texture: ImageSize;
+
+    fn draw<F: FnMut(Context, &mut Self::Graphics)>(
+        &mut self,
+        render_args: RenderArgs,
+        f: F
+    );
+
+    fn load_bee_texture(&self) -> Self::Texture;
+}
+
+pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
+    window: &mut W, left: WC, right: WC, mut backend: B
+) {
+    // Run as fast as possible to train the bee.
+    let event_settings = EventSettings::new().bench_mode(true).ups(10).max_fps(2);
+    let mut events = Events::new(event_settings);
+    let hive_pos = [200.0, 200.0];
+    let flower_pos = [200.0, 100.0];
+    let bee_texture = backend.load_bee_texture();
+    let mut app = App {
+        hive: Hive {
+            pos: hive_pos
+        },
+        flower: Flower {
+            pos: flower_pos
+        },
+        bee: Bee {
+            pos: hive_pos,
+            vel: [0.0; 2],
+            state: BeeState::InAir
+        },
+        textures: vec![
+            bee_texture,
+        ],
+        render_settings: AppRenderSettings {
+            draw_bee_pos: true,
+            draw_target_pos: true,
+        },
+        physics_settings: AppPhysicsSettings {
+            gravity: [0.0, 20.0],
+        },
+        runtime: asi::StandardRuntime::new(),
+    };
+    let flap_repeat = 0.25;
+    app.runtime.load(asi::Agent {
+        actuators: vec![
+            Actuator::FlapLeft(FlapWing {
+                received: true,
+                // When flapping left wing, move right-up.
+                impulse: [30.0, -30.0],
+                force_function: EaseFunction::QuadraticInOut,
+                remaining: 0.0,
+                repeat_delay: flap_repeat,
+            }),
+            Actuator::FlapRight(FlapWing {
+                received: true,
+                // When flapping right wing, move left-up.
+                impulse: [-30.0, -30.0],
+                force_function: EaseFunction::QuadraticInOut,
+                remaining: 0.0,
+                repeat_delay: flap_repeat,
+            }),
+        ],
+        sensors: vec![
+            Sensor::Position([0.0; 2]),
+        ],
+        memory: vec![
+            Memory::Dummy,
+            Memory::Dummy,
+        ],
+        decision_maker: DecisionMaker {
+            sub_goal: SubGoal::GoToFlower,
+            left_flap_state: FlapState {wait: 0.0},
+            right_flap_state: FlapState {wait: 0.25},
+            left_repeat: 1.4,
+            right_repeat: 1.4,
+            left_min_repeat: flap_repeat,
+            right_min_repeat: flap_repeat,
+            left_wing_controller: left,
+            right_wing_controller: right,
+            target: hive_pos,
+            position: hive_pos,
+            avg: [0.0; 2],
+        },
+    });
+    app.runtime.start();
+    let mut tries = 0;
+    let mut time = 0.0;
+    let mut record = 0.0;
+    while let Some(e) = events.next(window) {
+        app.event(&e);
+        if let Some(args) = e.render_args() {
+            backend.draw(args, |c, g| {
+                clear(color::hex("ffffff"), g);
+                app.draw(&c, g);
+            })
+        }
+
+        if let Some(args) = e.update_args() {
+            time += args.dt;
+        }
+
+        let reset = e.press_args().is_some() ||
+                    vecmath::vec2_len(vecmath::vec2_sub(app.bee.pos, hive_pos)) > 200.0;
+
+        if reset {
+            app.bee.pos = hive_pos;
+            app.bee.vel = [0.0; 2];
+            let ref mut dm = app.runtime.agent.as_mut().unwrap().decision_maker;
+            dm.left_wing_controller.set_started(false);
+            dm.right_wing_controller.set_started(false);
+            dm.avg = [0.0; 2];
+            tries += 1;
+            window.set_title(format!("asi_core0: bee ({}, {:.2})", tries, record));
+            if time > record {
+                record = time;
+            }
+            time = 0.0;
+        }
+    }
+}
 
 pub struct AppRenderSettings {
     pub draw_bee_pos: bool,
@@ -23,17 +150,17 @@ pub struct AppPhysicsSettings {
     pub gravity: [f64; 2],
 }
 
-pub struct App<Texture> {
+pub struct App<Texture, W> where W: WingController {
     pub hive: Hive,
     pub flower: Flower,
     pub bee: Bee,
     pub textures: Vec<Texture>,
     pub render_settings: AppRenderSettings,
     pub physics_settings: AppPhysicsSettings,
-    pub runtime: asi::StandardRuntime<Sensor, Actuator, Memory, DecisionMaker>,
+    pub runtime: asi::StandardRuntime<Sensor, Actuator, Memory, DecisionMaker<W>>,
 }
 
-impl<Texture: ImageSize> App<Texture> {
+impl<Texture: ImageSize, W: WingController> App<Texture, W> {
     pub fn event(&mut self, e: &impl GenericEvent) {
         use vecmath::vec2_add as add;
 
@@ -240,199 +367,119 @@ impl FlapState {
     }
 }
 
-/// Used to control actuators with unknown and noisy behavior.
-/// Based on a universal heuristic of distance to target,
-/// which makes the controller dimensional independent.
-///
-/// This controller is designed for rapid learning and adapting.
-/// It learns continuously and rapidly in response to the environment.
-/// The idea is that the controller must be adaptable to a wide
-/// range of environments where being a fast learner is better
-/// than deep analysis.
-///
-/// The design logic of this controller might seem absurdly recursive.
-/// This is because how it learns depends on how it is used.
-///
-/// The controller predicts how distance to target will change
-/// from being told a new control value,
-/// relative to the distance if the control value was not changed.
-///
-/// The controller assumes that its prediction might or not might
-/// be followed, such that it tries to predict what the change
-/// will actually be, instead of trying to predict conditioned on the change.
-/// The predictor takes into account the effect of response to the prediction,
-/// which is reflected in the predicted change.
-///
-/// The user of the controller decides what to do about the prediction,
-/// which is natural since you only want to try a new value if it
-/// brings the distance to target closer to the goal.
-///
-/// Since the predictor takes into account what the user will do,
-/// the user knows that the decision acts on the best guess
-/// that the predictor has instead of an alternative future.
-///
-/// Not only does the controller predict changes in distance,
-/// but it also predicts its own error, which is used to improve learning.
-pub struct DistanceHeuristicController {
-    /// Whether the controller has started.
-    pub started: bool,
-    /// Control value.
-    pub value: f64,
-    /// The old distance.
-    pub old_distance: [f64; 2],
-    /// The predicted change in distance per unit of time.
-    pub prediction: [f64; 2],
-    /// Predicted error in predicted change.
-    pub error: f64,
-    /// A factor describing how much to tune predictions.
-    pub tune: f64,
-    /// A sub-tree which predicts how the controller would behave
-    /// if the control value was changed.
-    /// These sub-controllers advice the prediction.
-    pub children: Vec<DistanceHeuristicController>,
-}
+pub trait WingController {
+    /// Returns `true` if the wing controller has started.
+    fn get_started(&self) -> bool;
+    /// Sets whether the wing controller has started.
+    fn set_started(&mut self, value: bool);
+    /// Get the value of the wing controller.
+    fn get_value(&self) -> f64;
+    /// Set value of the wing controller.
+    fn set_value(&mut self, value: f64);
+    /// Get predicted vector.
+    fn get_prediction(&self) -> [f64; 2];
+    /// Set predicted vector.
+    fn set_prediction(&mut self, [f64; 2]);
+    /// Get old vector from previous learning.
+    fn get_old_vector(&self) -> [f64; 2];
+    /// Sets old vector from previous learning.
+    fn set_old_vector(&mut self, value: [f64; 2]);
+    /// Get expected error.
+    fn get_error(&self) -> f64;
+    /// Set expected error.
+    fn set_error(&mut self, value: f64);
+    /// Get the tuning spring parameter.
+    fn get_tune(&self) -> f64;
+    /// Predict future vector given that `new_value` is used.
+    fn predict(&self, new_value: f64, dt: f64) -> [f64; 2];
 
-impl DistanceHeuristicController {
-    pub fn start(&mut self, value: f64, distance: [f64; 2]) {
-        self.value = value;
-        self.old_distance = distance;
-        self.started = true;
+    /// Called at beginning or when resetting position.
+    fn start(&mut self, value: f64, vector: [f64; 2]) {
+        self.set_value(value);
+        self.set_old_vector(vector);
+        self.set_started(true);
     }
 
-    /// Sets new value.
-    pub fn set_value(&mut self, value: f64) {
-        if value == self.value {return};
-
-        let mut min_value_dist: Option<(usize, f64)> = None;
-        for i in 0..self.children.len() {
-            let ref mut child = self.children[i];
-            let value_dist = (child.value - value) * (child.value - value);
-            if min_value_dist.is_none() || min_value_dist.unwrap().1 > value_dist {
-                min_value_dist = Some((i, value_dist));
-            }
-        }
-
-        if let Some((i, child_value)) = min_value_dist {
-            if child_value < (self.value - value) * (self.value - value) {
-                use std::mem::swap;
-
-                // Swap values with child since it is more likely to be
-                // a better starting point than the current one.
-                let ref mut child = self.children[i];
-                swap(&mut self.prediction, &mut child.prediction);
-                swap(&mut self.value, &mut child.value);
-                swap(&mut self.old_distance, &mut child.old_distance);
-                swap(&mut self.error, &mut child.error);
-                self.value = value;
-                return;
-            }
-        }
-        if self.children.len() < 1 {
-            // Remember what is learned so far.
-            let new_child = DistanceHeuristicController {children: vec![], ..*self};
-            self.children.push(new_child);
-        }
-
-        self.value = value;
-    }
-
-    /// Learns when moving to a new distance.
-    /// The control value might have changed in the mean time.
-    pub fn learn(&mut self, new_distance: [f64; 2], dt: f64) {
-        use vecmath::vec2_add as add;
-        use vecmath::vec2_scale as scale;
-
-        let eps = [
-            0.0000000000001 + rand::random::<f64>() * self.tune * self.error,
-            0.0000000000001 + rand::random::<f64>() * self.tune * self.error
-        ];
-
-        let error_middle = self.error(new_distance, dt);
-        self.prediction = add(self.prediction, eps);
-        let error_up = self.error(new_distance, dt);
-        self.prediction = add(self.prediction, scale(eps, -2.0));
-        let error_down = self.error(new_distance, dt);
-        if error_middle < error_up && error_middle < error_down {
-            // Change back.
-            self.prediction = add(self.prediction, eps);
-        } else if error_up < error_down {
-            // Go up.
-            self.prediction = add(self.prediction, scale(eps, 2.0));
-        }
-        self.prediction = [
-            self.prediction[0].min(10.0).max(-10.0),
-            self.prediction[1].min(10.0).max(-10.0),
-        ];
-
-        let eps = 0.0000000000001 + rand::random::<f64>() * self.tune * self.error;
-
-        let error_middle = self.error(new_distance, dt);
-        self.error += eps;
-        let error_up = self.error(new_distance, dt);
-        self.error -= 2.0 * eps;
-        let error_down = self.error(new_distance, dt);
-        if error_middle < error_up && error_middle < error_down {
-            self.error += eps;
-        }  else if error_up < error_down {
-            self.error += 2.0 * eps;
-        }
-        self.error = self.error.min(20.0).max(0.0);
-
-        self.old_distance = new_distance;
-    }
-
-    pub fn error(&self, new_distance: [f64; 2], dt: f64) -> f64 {
+    /// Returns error from current prediction.
+    ///
+    /// The error includes a term for predicted error.
+    fn error(&self, new_vector: [f64; 2], dt: f64) -> f64 {
         use vecmath::vec2_sub as sub;
         use vecmath::vec2_scale as scale;
         use vecmath::vec2_len as len;
 
         // The actual change in distance per unit of time.
-        let change = scale(sub(new_distance, self.old_distance), 1.0 / dt);
-        let error = len(sub(change, self.predict(self.value, dt))).powi(2);
-        error + (self.error - error).abs()
+        let change = scale(sub(new_vector, self.get_old_vector()), 1.0 / dt);
+        let error = len(sub(change, self.predict(self.get_value(), dt))).powi(2);
+        error + (self.get_error() - error).abs()
     }
 
-    /// Predicts a change in distance from a new value.
-    pub fn predict(&self, new_value: f64, dt: f64) -> [f64; 2] {
+    /// Learns when moving to a new distance.
+    /// The control value might have changed in the mean time.
+    fn learn(&mut self, new_vector: [f64; 2], dt: f64) {
         use vecmath::vec2_add as add;
         use vecmath::vec2_scale as scale;
-        use vecmath::vec2_len as len;
 
-        // Use weighted average of predictions of itself and children.
-        // Compute weight by taking into account how close they are to the new value,
-        // how close their last distance is to extrapolated half distance,
-        // and how far into the future and the predicted error.
-        // Estimate the predicted distance given no change.
-        let dist = len(add(self.old_distance, scale(self.prediction, 0.5 * dt)));
-        let mut weight = 1.0 / ((self.value - new_value) * (self.value - new_value) + dt + self.error);
-        let mut prediction = scale(self.prediction, weight);
-        for i in 0..self.children.len() {
-            let ref child = self.children[i];
-            // Compute the predicted distance of child.
-            let child_dist = len(add(child.old_distance, scale(child.prediction, 0.5 * dt)));
-            let w = 1.0 /
-                    ((child.value - new_value) * (child.value - new_value) +
-                     (child_dist - dist) * (child_dist - dist) + dt + child.error);
-            prediction = add(prediction, scale(child.prediction, w));
-            weight += w;
+        let eps = [
+            0.0000000000001 + rand::random::<f64>() * self.get_tune() * self.get_error(),
+            0.0000000000001 + rand::random::<f64>() * self.get_tune() * self.get_error()
+        ];
+
+        let error_middle = self.error(new_vector, dt);
+        let pred = self.get_prediction();
+        self.set_prediction(add(pred, eps));
+        let error_up = self.error(new_vector, dt);
+        let pred = self.get_prediction();
+        self.set_prediction(add(pred, scale(eps, -2.0)));
+        let error_down = self.error(new_vector, dt);
+        if error_middle < error_up && error_middle < error_down {
+            // Change back.
+            let pred = self.get_prediction();
+            self.set_prediction(add(pred, eps));
+        } else if error_up < error_down {
+            // Go up.
+            let pred = self.get_prediction();
+            self.set_prediction(add(pred, scale(eps, 2.0)));
         }
-        scale(prediction, dt / weight)
+
+        // Clamp prediction.
+        let pred = self.get_prediction();
+        self.set_prediction([
+            pred[0].min(10.0).max(-10.0),
+            pred[1].min(10.0).max(-10.0),
+        ]);
+
+        let eps = 0.0000000000001 + rand::random::<f64>() * self.get_tune() * self.get_error();
+
+        let error_middle = self.error(new_vector, dt);
+        let err = self.get_error();
+        self.set_error(err + eps);
+        let error_up = self.error(new_vector, dt);
+        let err = self.get_error();
+        self.set_error(err - 2.0 * eps);
+        let error_down = self.error(new_vector, dt);
+        if error_middle < error_up && error_middle < error_down {
+            let err = self.get_error();
+            self.set_error(err + eps);
+        }  else if error_up < error_down {
+            let err = self.get_error();
+            self.set_error(err + 2.0 * eps);
+        }
+
+        // Clamp the error.
+        let err = self.get_error();
+        self.set_error(err.min(20.0).max(0.0));
+
+        self.set_old_vector(new_vector);
     }
 
     /// Set new value out of some candidates.
-    pub fn pick<F: Fn(f64) -> bool>(&mut self, dt: f64, values: &[f64], filter: F) {
+    fn pick<F: Fn(f64) -> bool>(&mut self, dt: f64, values: &[f64], filter: F) {
         use vecmath::vec2_len as len;
 
         let mut min: Option<(usize, f64)> = None;
         for i in 0..values.len() {
             if filter(values[i]) {
-                /*
-                if rand::random::<f64>() < 1.0 * dt {
-                    self.set_value(values[i]);
-                    return;
-                }
-                */
-
                 let pred = len(self.predict(values[i], dt));
                 if min.is_none() || min.unwrap().1 > pred {
                     min = Some((i, pred));
@@ -446,7 +493,7 @@ impl DistanceHeuristicController {
 }
 
 /// The Bee's decision maker.
-pub struct DecisionMaker {
+pub struct DecisionMaker<W> where W: WingController {
     pub sub_goal: SubGoal,
     // The flap state of left wing before trying another flap.
     pub left_flap_state: FlapState,
@@ -465,9 +512,9 @@ pub struct DecisionMaker {
     // to prepare itself for another flap.
     pub right_min_repeat: f64,
     /// Controls left wing.
-    pub left_wing_controller: DistanceHeuristicController,
+    pub left_wing_controller: W,
     /// Controls right wing.
-    pub right_wing_controller: DistanceHeuristicController,
+    pub right_wing_controller: W,
     /// Current target position.
     pub target: [f64; 2],
     /// Previously measured position.
@@ -476,7 +523,7 @@ pub struct DecisionMaker {
     pub avg: [f64; 2],
 }
 
-impl asi::DecisionMaker<Memory> for DecisionMaker {
+impl<W: WingController> asi::DecisionMaker<Memory> for DecisionMaker<W> {
     fn next_action(&mut self, memory: &[Memory], dt: f64) -> asi::Action {
         use asi::Action::*;
         use vecmath::vec2_sub as sub;
@@ -495,10 +542,10 @@ impl asi::DecisionMaker<Memory> for DecisionMaker {
         let s = sub(self.target, self.position);
         self.avg = add(self.avg, scale(sub(s, self.avg), 1.0 * dt));
         let avg = self.avg;
-        if !self.left_wing_controller.started {
+        if !self.left_wing_controller.get_started() {
             self.left_wing_controller.start(self.left_repeat, avg);
         }
-        if !self.right_wing_controller.started {
+        if !self.right_wing_controller.get_started() {
             self.right_wing_controller.start(self.right_repeat, avg);
         }
         self.left_wing_controller.learn(avg, dt);
@@ -506,16 +553,17 @@ impl asi::DecisionMaker<Memory> for DecisionMaker {
 
         let mut arr = [0.0; 20];
 
-        let ch = 0.16;
+        let ch = 0.15;
         for i in 0..arr.len() {arr[i] = self.left_repeat + ch * (i as f64 / arr.len() as f64 - 0.5)}
         self.left_wing_controller.pick(dt, &arr, |val| val >= 1.4 && val < 2.0);
         for i in 0..arr.len() {arr[i] = self.right_repeat + ch * (i as f64 / arr.len() as f64 - 0.5)}
         self.right_wing_controller.pick(dt, &arr, |val| val >= 1.4 && val < 2.0);
 
-        self.left_repeat = self.left_wing_controller.value;
-        self.right_repeat = self.right_wing_controller.value;
-        // println!("TEST left_repeat {} right_repeat {} dist {}", self.left_repeat, self.right_repeat, dist);
-        println!("TEST err {} pred {:?}", self.left_wing_controller.error, self.left_wing_controller.prediction);
+        self.left_repeat = self.left_wing_controller.get_value();
+        self.right_repeat = self.right_wing_controller.get_value();
+        println!("TEST err {} pred {:?}",
+                 self.left_wing_controller.get_error(),
+                 self.left_wing_controller.get_prediction());
 
         self.left_flap_state.update(dt);
         self.right_flap_state.update(dt);
