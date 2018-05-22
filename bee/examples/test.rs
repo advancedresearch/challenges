@@ -12,7 +12,7 @@ use sdl2_window::Sdl2Window;
 use piston::window::*;
 use piston::input::*;
 use graphics::*;
-use bee_challenge::{run, WingController};
+use bee_challenge::{run, EnvironmentSettings, WingController};
 
 struct Backend {
     gl: GlGraphics,
@@ -67,7 +67,10 @@ fn main() {
         tune,
         children: vec![],
     };
-    run(&mut window, left, right, backend);
+    let mut settings = EnvironmentSettings::new();
+    settings.ups = 10;
+    settings.max_fps = 10;
+    run(&mut window, left, right, backend, settings);
 }
 
 pub struct HeuristicController {

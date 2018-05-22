@@ -16,6 +16,59 @@ use std::fmt;
 
 const BEE_TEXTURE: usize = 0;
 
+/// Stores settings for environment.
+pub struct EnvironmentSettings {
+    /// Starting position for bee.
+    pub hive_pos: [f64; 2],
+    /// The gravity vector.
+    pub gravity: [f64; 2],
+    /// How long a flap lasts.
+    pub flap_repeat: f64,
+    /// The maximum impulse for left wing.
+    pub impulse_left: [f64; 2],
+    /// The maximum impulse for right wing.
+    pub impulse_right: [f64; 2],
+    /// The starting repeat interval for left wing.
+    pub start_left_repeat: f64,
+    /// The starting repeat interval for right wing.
+    pub start_right_repeat: f64,
+    /// The amount of different when adjusting flap repeat.
+    pub side_step: f64,
+    /// The number of options to consider.
+    pub options: usize,
+    /// Whether to run the event loop in benchmark mode.
+    pub bench_mode: bool,
+    /// The Updates Per Frame (UPS) for event loop.
+    /// Decreasing this might lead to faster training,
+    /// but more inaccurate simulation.
+    pub ups: u64,
+    /// The maximum Frames Per Second (FPS) for event loop.
+    /// Reducing FPS might help speed up benchmark mode.
+    pub max_fps: u64,
+    /// The spring coefficient for moving average.
+    pub avg_spring: f64,
+}
+
+impl EnvironmentSettings {
+    pub fn new() -> EnvironmentSettings {
+        EnvironmentSettings {
+            hive_pos: [200.0; 2],
+            gravity: [0.0, 20.0],
+            flap_repeat: 0.25,
+            impulse_left: [30.0, -30.0],
+            impulse_right: [-30.0, -30.0],
+            start_left_repeat: 1.4,
+            start_right_repeat: 1.4,
+            side_step: 0.15,
+            options: 20,
+            bench_mode: false,
+            ups: 30,
+            max_fps: 30,
+            avg_spring: 1.0,
+        }
+    }
+}
+
 pub trait Backend {
     type Graphics: Graphics<Texture = Self::Texture>;
     type Texture: ImageSize;
@@ -30,12 +83,15 @@ pub trait Backend {
 }
 
 pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
-    window: &mut W, left: WC, right: WC, mut backend: B
+    window: &mut W, left: WC, right: WC, mut backend: B, settings: EnvironmentSettings,
 ) {
     // Run as fast as possible to train the bee.
-    let event_settings = EventSettings::new().bench_mode(true).ups(10).max_fps(2);
+    let event_settings = EventSettings::new()
+        .bench_mode(settings.bench_mode)
+        .ups(settings.ups)
+        .max_fps(settings.max_fps);
     let mut events = Events::new(event_settings);
-    let hive_pos = [200.0, 200.0];
+    let hive_pos = settings.hive_pos;
     let flower_pos = [200.0, 100.0];
     let bee_texture = backend.load_bee_texture();
     let mut app = App {
@@ -58,17 +114,17 @@ pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
             draw_target_pos: true,
         },
         physics_settings: AppPhysicsSettings {
-            gravity: [0.0, 20.0],
+            gravity: settings.gravity,
         },
         runtime: asi::StandardRuntime::new(),
     };
-    let flap_repeat = 0.25;
+    let flap_repeat = settings.flap_repeat;
     app.runtime.load(asi::Agent {
         actuators: vec![
             Actuator::FlapLeft(FlapWing {
                 received: true,
                 // When flapping left wing, move right-up.
-                impulse: [30.0, -30.0],
+                impulse: settings.impulse_left,
                 force_function: EaseFunction::QuadraticInOut,
                 remaining: 0.0,
                 repeat_delay: flap_repeat,
@@ -76,7 +132,7 @@ pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
             Actuator::FlapRight(FlapWing {
                 received: true,
                 // When flapping right wing, move left-up.
-                impulse: [-30.0, -30.0],
+                impulse: settings.impulse_right,
                 force_function: EaseFunction::QuadraticInOut,
                 remaining: 0.0,
                 repeat_delay: flap_repeat,
@@ -93,8 +149,8 @@ pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
             sub_goal: SubGoal::GoToFlower,
             left_flap_state: FlapState {wait: 0.0},
             right_flap_state: FlapState {wait: 0.25},
-            left_repeat: 1.4,
-            right_repeat: 1.4,
+            left_repeat: settings.start_left_repeat,
+            right_repeat: settings.start_right_repeat,
             left_min_repeat: flap_repeat,
             right_min_repeat: flap_repeat,
             left_wing_controller: left,
@@ -102,6 +158,9 @@ pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
             target: hive_pos,
             position: hive_pos,
             avg: [0.0; 2],
+            avg_spring: settings.avg_spring,
+            side_step: settings.side_step,
+            options: vec![0.0; settings.options],
         },
     });
     app.runtime.start();
@@ -521,6 +580,12 @@ pub struct DecisionMaker<W> where W: WingController {
     pub position: [f64; 2],
     /// Moving avarage distance from target.
     pub avg: [f64; 2],
+    /// Spring coefficient to moving average.
+    pub avg_spring: f64,
+    /// The amount of change in repeat time.
+    pub side_step: f64,
+    /// Stores options to consider when predicting possible futures.
+    pub options: Vec<f64>,
 }
 
 impl<W: WingController> asi::DecisionMaker<Memory> for DecisionMaker<W> {
@@ -540,7 +605,7 @@ impl<W: WingController> asi::DecisionMaker<Memory> for DecisionMaker<W> {
         }
 
         let s = sub(self.target, self.position);
-        self.avg = add(self.avg, scale(sub(s, self.avg), 1.0 * dt));
+        self.avg = add(self.avg, scale(sub(s, self.avg), self.avg_spring * dt));
         let avg = self.avg;
         if !self.left_wing_controller.get_started() {
             self.left_wing_controller.start(self.left_repeat, avg);
@@ -551,9 +616,9 @@ impl<W: WingController> asi::DecisionMaker<Memory> for DecisionMaker<W> {
         self.left_wing_controller.learn(avg, dt);
         self.right_wing_controller.learn(avg, dt);
 
-        let mut arr = [0.0; 20];
+        let ref mut arr = self.options;
 
-        let ch = 0.15;
+        let ch = self.side_step;
         for i in 0..arr.len() {arr[i] = self.left_repeat + ch * (i as f64 / arr.len() as f64 - 0.5)}
         self.left_wing_controller.pick(dt, &arr, |val| val >= 1.4 && val < 2.0);
         for i in 0..arr.len() {arr[i] = self.right_repeat + ch * (i as f64 / arr.len() as f64 - 0.5)}
