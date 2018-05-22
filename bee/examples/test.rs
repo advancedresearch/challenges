@@ -70,6 +70,7 @@ fn main() {
     let mut settings = EnvironmentSettings::new();
     settings.ups = 10;
     settings.max_fps = 10;
+    settings.bench_mode = true;
     run(&mut window, left, right, backend, settings);
 }
 
