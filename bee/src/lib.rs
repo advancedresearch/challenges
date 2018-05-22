@@ -617,12 +617,3 @@ pub mod math {
         *vel = add(*vel, scale(acc, 0.5 * dt));
     }
 }
-
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
