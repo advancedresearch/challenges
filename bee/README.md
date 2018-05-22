@@ -51,7 +51,8 @@ This behavior can be overridden since it is written as default trait methods.
 
 ### Description
 
-The environment uses the [Piston](https://github.com/pistondevelopers/piston) game engine.
+The environment uses the [Piston](https://github.com/pistondevelopers/piston) game engine. One benefit with Piston is that the game loop can run in
+benchmark mode to train agents faster.
 
 The bee has two wings, one for the left side and one for the right.
 
