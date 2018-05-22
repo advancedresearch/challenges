@@ -28,10 +28,12 @@ pub struct EnvironmentSettings {
     pub impulse_left: [f64; 2],
     /// The maximum impulse for right wing.
     pub impulse_right: [f64; 2],
-    /// The starting repeat interval for left wing.
-    pub start_left_repeat: f64,
-    /// The starting repeat interval for right wing.
-    pub start_right_repeat: f64,
+    /// The starting repeat interval for both wings.
+    pub start_repeat: f64,
+    /// The minimum repeat interval for both wings.
+    pub min_repeat: f64,
+    /// The maximum repeat interval for both wings.
+    pub max_repeat: f64,
     /// The amount of different when adjusting flap repeat.
     pub side_step: f64,
     /// The number of options to consider.
@@ -57,8 +59,9 @@ impl EnvironmentSettings {
             flap_repeat: 0.25,
             impulse_left: [30.0, -30.0],
             impulse_right: [-30.0, -30.0],
-            start_left_repeat: 1.4,
-            start_right_repeat: 1.4,
+            start_repeat: 1.4,
+            min_repeat: 1.4,
+            max_repeat: 2.0,
             side_step: 0.15,
             options: 20,
             bench_mode: false,
@@ -149,10 +152,12 @@ pub fn run<W: AdvancedWindow, WC: WingController, B: Backend>(
             sub_goal: SubGoal::GoToFlower,
             left_flap_state: FlapState {wait: 0.0},
             right_flap_state: FlapState {wait: 0.25},
-            left_repeat: settings.start_left_repeat,
-            right_repeat: settings.start_right_repeat,
-            left_min_repeat: flap_repeat,
-            right_min_repeat: flap_repeat,
+            left_repeat: settings.start_repeat,
+            right_repeat: settings.start_repeat,
+            left_min_repeat: settings.min_repeat,
+            left_max_repeat: settings.max_repeat,
+            right_min_repeat: settings.max_repeat,
+            right_max_repeat: settings.max_repeat,
             left_wing_controller: left,
             right_wing_controller: right,
             target: hive_pos,
@@ -566,10 +571,14 @@ pub struct DecisionMaker<W> where W: WingController {
     // This is the time it takes for the left wing actuator
     // to prepare itself for another flap.
     pub left_min_repeat: f64,
+    /// Maximum time to repeat for left wing.
+    pub left_max_repeat: f64,
     // Minimum time to repeat for right wing.
     // This is the time it takes for the right wing actuator
     // to prepare itself for another flap.
     pub right_min_repeat: f64,
+    /// Maximum time to repeat for right wing.
+    pub right_max_repeat: f64,
     /// Controls left wing.
     pub left_wing_controller: W,
     /// Controls right wing.
@@ -618,11 +627,14 @@ impl<W: WingController> asi::DecisionMaker<Memory> for DecisionMaker<W> {
 
         let ref mut arr = self.options;
 
-        let ch = self.side_step;
-        for i in 0..arr.len() {arr[i] = self.left_repeat + ch * (i as f64 / arr.len() as f64 - 0.5)}
-        self.left_wing_controller.pick(dt, &arr, |val| val >= 1.4 && val < 2.0);
-        for i in 0..arr.len() {arr[i] = self.right_repeat + ch * (i as f64 / arr.len() as f64 - 0.5)}
-        self.right_wing_controller.pick(dt, &arr, |val| val >= 1.4 && val < 2.0);
+        let min = self.left_min_repeat;
+        let max = self.left_max_repeat;
+        for i in 0..arr.len() {arr[i] = self.left_repeat + self.side_step * (i as f64 / arr.len() as f64 - 0.5)}
+        self.left_wing_controller.pick(dt, &arr, |val| val >= min && val < max);
+        let min = self.right_min_repeat;
+        let max = self.right_max_repeat;
+        for i in 0..arr.len() {arr[i] = self.right_repeat + self.side_step * (i as f64 / arr.len() as f64 - 0.5)}
+        self.right_wing_controller.pick(dt, &arr, |val| val >= min && val < max);
 
         self.left_repeat = self.left_wing_controller.get_value();
         self.right_repeat = self.right_wing_controller.get_value();
