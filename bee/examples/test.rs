@@ -1,6 +1,6 @@
 extern crate asi_core0 as asi;
 extern crate piston;
-extern crate sdl2_window;
+extern crate glutin_window;
 extern crate opengl_graphics;
 extern crate graphics;
 extern crate vecmath;
@@ -8,7 +8,7 @@ extern crate rand;
 extern crate bee_challenge;
 
 use opengl_graphics::*;
-use sdl2_window::Sdl2Window;
+use glutin_window::GlutinWindow;
 use piston::window::*;
 use piston::input::*;
 use graphics::*;
@@ -43,7 +43,7 @@ fn main() {
     let settings = WindowSettings::new("asi_core0: bee", [640, 480])
         .exit_on_esc(true)
         .opengl(opengl);
-    let mut window: Sdl2Window = settings.build().unwrap();
+    let mut window: GlutinWindow = settings.build().unwrap();
 
     let backend = Backend {
         gl: GlGraphics::new(opengl)
